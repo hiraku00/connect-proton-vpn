@@ -4,8 +4,9 @@ set -euo pipefail
 BASE_WAIT="${BASE_WAIT:-45}"
 LONG_WAIT="${LONG_WAIT:-600}"
 MAX_TRIES="${MAX_TRIES:-0}"
+DISCONNECT_THRESHOLD=60 # これ以上の秒数待つ場合は切断する
 
-# コマンド定義（タイムアウト設定を追加し、安定性を向上）
+# コマンド定義
 CONNECT_CMD="osascript -e 'with timeout of 5 seconds
   tell application \"System Events\" to tell process \"ProtonVPN\" to click button \"Change server\" of window 1
 end timeout'"
@@ -26,17 +27,20 @@ log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"
 }
 
-# カウントダウン表示用の関数
+# カウントダウン表示用の関数（同一行で更新）
 countdown() {
   local seconds=$1
   local msg=$2
+  # 最初の1回だけログに記録
+  log "${msg}（${seconds}秒待機）"
+  
   while [ $seconds -gt 0 ]; do
-    printf "\r[%s] %s (残り %d 秒)    " "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" "$seconds"
+    # コンソール上でのみ表示を更新（\r で行頭に戻る）
+    printf "\r\033[K[%s] %s (残り %d 秒)" "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" "$seconds"
     sleep 1
     seconds=$((seconds - 1))
   done
-  printf "\r"
-  echo ""
+  printf "\r\033[K" # 行をクリアして行頭に戻る
 }
 
 need_cmd() {
@@ -93,21 +97,29 @@ is_japan() {
   esac
 }
 
-# アプリ上のタイマー（09:59など）を取得
-get_timer() {
-  osascript -e 'with timeout of 5 seconds
+# アプリ上のタイマー（09:59など）を取得し、秒数で返す
+get_timer_seconds() {
+  local timer_text
+  timer_text=$(osascript -e 'with timeout of 5 seconds
     tell application "System Events" to tell process "ProtonVPN"
-      set timer_text to ""
       set all_texts to value of every static text of window 1
       repeat with t in all_texts
-        if t contains ":" and (count of t) is 5 then
-          set timer_text to t
-          exit repeat
+        set t_str to t as string
+        if t_str contains ":" and (length of t_str) is 5 then
+          return t_str
         end if
       end repeat
-      return timer_text
     end tell
-  end timeout' 2>/dev/null || echo ""
+  end timeout' 2>/dev/null || echo "")
+
+  # MM:SS を秒数に変換
+  if [[ "$timer_text" =~ ^([0-9]{2}):([0-9]{2})$ ]]; then
+    local min=${BASH_REMATCH[1]}
+    local sec=${BASH_REMATCH[2]}
+    echo $((10#$min * 60 + 10#$sec))
+  else
+    echo "0"
+  fi
 }
 
 vpn_info() {
@@ -134,7 +146,7 @@ main() {
   need_cmd osascript
 
   log "Proton VPN 日本接続監視を開始します"
-  log "通常待機: ${BASE_WAIT}秒, 制限時待機: ${LONG_WAIT}秒"
+  log "通常待機: ${BASE_WAIT}秒, 最大制限時待機: ${LONG_WAIT}秒"
 
   # 初回起動時、未接続なら Quick Connect を試みる
   log "初期チェック: Quick Connect を試行します..."
@@ -162,32 +174,44 @@ main() {
     fi
 
     # 4. タイマー（制限時間）が出ていないか確認
-    local vpn_timer=""
-    vpn_timer=$(get_timer)
-    if [[ -n "$vpn_timer" ]]; then
-      log "制限タイマーを検知しました（残り ${vpn_timer}）。10分待機モードに入ります。"
+    local wait_sec=0
+    wait_sec=$(get_timer_seconds)
+
+    if [ "$wait_sec" -gt 0 ]; then
+      log "制限タイマーを検知しました（残り ${wait_sec} 秒）。"
+      wait_sec=$((wait_sec + 5))
     elif change_not_available; then
-      # ボタンが無効なら通常の待機をして再確認
-      countdown "$BASE_WAIT" "日本ではありません。通常待機中..."
+      # タイマーがなくてもボタンが無効なら通常の待機をして再確認
+      countdown "$BASE_WAIT" "日本ではありません。制限確認中..."
       if change_not_available; then
-        log "待機後もボタンが無効です。10分待機モードに入ります。"
+        log "待機後もボタンが無効です。最大制限時間で待機します。"
+        wait_sec="$LONG_WAIT"
       else
         continue
       fi
     else
-      # ボタンが有効なら、45秒待って次へ
-      countdown "$BASE_WAIT" "日本ではありません。通常待機中..."
+      # ボタンが最初から有効なら、単に待って次へ
+      countdown "$BASE_WAIT" "日本ではありません。次を試行します..."
       continue
     fi
 
-    # 5. 10分待機モード（切断して待つ）
-    log "VPNを切断し、${LONG_WAIT}秒間待機します..."
-    eval "$DISCONNECT_CMD" >/dev/null 2>&1 || true
-    countdown "$LONG_WAIT" "制限解除を待機中..."
-    
-    log "待機終了。再接続します..."
-    eval "$QUICK_CONNECT_CMD" >/dev/null 2>&1 || true
-    sleep 15
+    # 5. 待機モード
+    if [ "$wait_sec" -gt 0 ]; then
+      if [ "$wait_sec" -ge "$DISCONNECT_THRESHOLD" ]; then
+        # 長い待ち時間の場合は切断する
+        log "待ち時間が長いため（${wait_sec}秒）、VPNを切断して待機します..."
+        eval "$DISCONNECT_CMD" >/dev/null 2>&1 || true
+        countdown "$wait_sec" "制限解除を待機中..."
+        
+        log "待機終了。再接続します..."
+        eval "$QUICK_CONNECT_CMD" >/dev/null 2>&1 || true
+        sleep 15
+      else
+        # 短い待ち時間の場合は接続したまま待つ
+        countdown "$wait_sec" "制限解除を接続したまま待機中..."
+        # 待機後はそのままループ（reconnect）へ
+      fi
+    fi
   done
 }
 
