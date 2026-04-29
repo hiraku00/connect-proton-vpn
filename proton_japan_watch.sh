@@ -4,21 +4,38 @@ set -euo pipefail
 BASE_WAIT="${BASE_WAIT:-45}"
 LONG_WAIT="${LONG_WAIT:-600}"
 MAX_TRIES="${MAX_TRIES:-0}"
-DISCONNECT_THRESHOLD=60 # これ以上の秒数待つ場合は切断する
+DISCONNECT_THRESHOLD="${DISCONNECT_THRESHOLD:-60}"
+TIMER_BUFFER="${TIMER_BUFFER:-2}"        # タイマー取得後のバッファ秒数
+INITIAL_WAIT="${INITIAL_WAIT:-5}"        # 初回起動時の待機秒数
+CONNECT_WAIT="${CONNECT_WAIT:-10}"       # サーバー切り替え後の安定待ち秒数
+RECONNECT_WAIT="${RECONNECT_WAIT:-15}"   # 再接続（Quick Connect）後の安定待ち秒数
+AS_TIMEOUT="${AS_TIMEOUT:-5}"            # AppleScriptのタイムアウト秒数
+CURL_TIMEOUT="${CURL_TIMEOUT:-10}"       # IP API取得のタイムアウト秒数
 
-# コマンド定義
-CONNECT_CMD="osascript -e 'with timeout of 5 seconds
-  tell application \"System Events\" to tell process \"ProtonVPN\" to click button \"Change server\" of window 1
-end timeout'"
-QUICK_CONNECT_CMD="osascript -e 'with timeout of 5 seconds
-  tell application \"System Events\" to tell process \"ProtonVPN\" to click button \"Quick Connect\" of window 1
-end timeout'"
-DISCONNECT_CMD="osascript -e 'with timeout of 5 seconds
-  tell application \"System Events\" to tell process \"ProtonVPN\" to click button \"Disconnect\" of window 1
-end timeout'"
-INFO_CMD="osascript -e 'with timeout of 5 seconds
-  tell application \"System Events\" to tell process \"ProtonVPN\" to get enabled of button \"Change server\" of window 1
-end timeout'"
+# GUI操作関数
+gui_connect() {
+  osascript -e "with timeout of ${AS_TIMEOUT} seconds
+    tell application \"System Events\" to tell process \"ProtonVPN\" to click button \"Change server\" of window 1
+  end timeout" >/dev/null 2>&1
+}
+
+gui_quick_connect() {
+  osascript -e "with timeout of ${AS_TIMEOUT} seconds
+    tell application \"System Events\" to tell process \"ProtonVPN\" to click button \"Quick Connect\" of window 1
+  end timeout" >/dev/null 2>&1
+}
+
+gui_disconnect() {
+  osascript -e "with timeout of ${AS_TIMEOUT} seconds
+    tell application \"System Events\" to tell process \"ProtonVPN\" to click button \"Disconnect\" of window 1
+  end timeout" >/dev/null 2>&1
+}
+
+gui_is_enabled() {
+  osascript -e "with timeout of ${AS_TIMEOUT} seconds
+    tell application \"System Events\" to tell process \"ProtonVPN\" to get enabled of button \"Change server\" of window 1
+  end timeout" 2>/dev/null || echo "false"
+}
 
 IP_API_URL="${IP_API_URL:-https://ipinfo.io/json}"
 LOG_FILE="${LOG_FILE:-./proton_japan_watch.log}"
@@ -56,7 +73,7 @@ get_country() {
   )
 
   for url in "${apis[@]}"; do
-    raw="$(curl -fsSL --max-time 10 "$url" 2>/dev/null || true)"
+    raw="$(curl -fsSL --max-time "$CURL_TIMEOUT" "$url" 2>/dev/null || true)"
     if [[ -n "$raw" && "$raw" == *"country"* ]]; then
       break
     fi
@@ -100,17 +117,17 @@ is_japan() {
 # アプリ上のタイマー（09:59など）を取得し、秒数で返す
 get_timer_seconds() {
   local timer_text
-  timer_text=$(osascript -e 'with timeout of 5 seconds
-    tell application "System Events" to tell process "ProtonVPN"
+  timer_text=$(osascript -e "with timeout of ${AS_TIMEOUT} seconds
+    tell application \"System Events\" to tell process \"ProtonVPN\"
       set all_texts to value of every static text of window 1
       repeat with t in all_texts
         set t_str to t as string
-        if t_str contains ":" and (length of t_str) is 5 then
+        if t_str contains \":\" and (length of t_str) is 5 then
           return t_str
         end if
       end repeat
     end tell
-  end timeout' 2>/dev/null || echo "")
+  end timeout" 2>/dev/null || echo "")
 
   # MM:SS を秒数に変換
   if [[ "$timer_text" =~ ^([0-9]{2}):([0-9]{2})$ ]]; then
@@ -122,19 +139,13 @@ get_timer_seconds() {
   fi
 }
 
-vpn_info() {
-  eval "$INFO_CMD" 2>/dev/null || echo "false"
-}
-
 change_not_available() {
-  local info_text
-  info_text="$(vpn_info)"
-  [[ "$info_text" == "false" ]]
+  [[ "$(gui_is_enabled)" == "false" ]]
 }
 
 reconnect() {
   log "サーバーを切り替えます（Change server）"
-  if ! eval "$CONNECT_CMD" >/dev/null 2>&1; then
+  if ! gui_connect; then
     log "切り替えボタンが見つからないか、クリックできませんでした。状態を確認します。"
     return 1
   fi
@@ -146,12 +157,12 @@ main() {
   need_cmd osascript
 
   log "Proton VPN 日本接続監視を開始します"
-  log "通常待機: ${BASE_WAIT}秒, 最大制限時待機: ${LONG_WAIT}秒"
+  log "設定: 通常待機=${BASE_WAIT}s, 最大制限=${LONG_WAIT}s, 切断閾値=${DISCONNECT_THRESHOLD}s, バッファ=${TIMER_BUFFER}s"
 
   # 初回起動時、未接続なら Quick Connect を試みる
   log "初期チェック: Quick Connect を試行します..."
-  eval "$QUICK_CONNECT_CMD" >/dev/null 2>&1 || log "Quick Connectは不要か、ボタンが見つかりません"
-  sleep 5
+  gui_quick_connect || log "Quick Connectは不要か、ボタンが見つかりません"
+  sleep "$INITIAL_WAIT"
 
   while true; do
     # 1. 現在の国を確認
@@ -165,7 +176,7 @@ main() {
     reconnect || log "切り替え試行中ですが、ボタンが一時的に無効な可能性があります。"
     
     # 接続完了を待つ
-    sleep 10
+    sleep "$CONNECT_WAIT"
     
     # 3. 直後の国判定
     if is_japan; then
@@ -179,7 +190,7 @@ main() {
 
     if [ "$wait_sec" -gt 0 ]; then
       log "制限タイマーを検知しました（残り ${wait_sec} 秒）。"
-      wait_sec=$((wait_sec + 5))
+      wait_sec=$((wait_sec + TIMER_BUFFER))
     elif change_not_available; then
       # タイマーがなくてもボタンが無効なら通常の待機をして再確認
       countdown "$BASE_WAIT" "日本ではありません。制限確認中..."
@@ -200,12 +211,12 @@ main() {
       if [ "$wait_sec" -ge "$DISCONNECT_THRESHOLD" ]; then
         # 長い待ち時間の場合は切断する
         log "待ち時間が長いため（${wait_sec}秒）、VPNを切断して待機します..."
-        eval "$DISCONNECT_CMD" >/dev/null 2>&1 || true
+        gui_disconnect || true
         countdown "$wait_sec" "制限解除を待機中..."
         
         log "待機終了。再接続します..."
-        eval "$QUICK_CONNECT_CMD" >/dev/null 2>&1 || true
-        sleep 15
+        gui_quick_connect || true
+        sleep "$RECONNECT_WAIT"
       else
         # 短い待ち時間の場合は接続したまま待つ
         countdown "$wait_sec" "制限解除を接続したまま待機中..."
