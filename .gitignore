@@ -7,3 +7,6 @@ proton_iphone.conf
 
 # macOS
 .DS_Store
+
+# Python
+__pycache__/
