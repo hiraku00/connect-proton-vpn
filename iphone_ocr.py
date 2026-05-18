@@ -82,20 +82,32 @@ def recognize_text_from_cgimage(image_ref) -> str:
 def extract_country_from_text(text: str) -> str | None:
     """
     OCR結果のテキストから接続国名を抽出する。
-    Proton VPN iPhoneアプリは「Browsing safely from」の下に国名を表示する。
     """
+    text_lower = text.lower()
+    
+    # 1. 「Japan」がテキスト内のどこかに含まれていれば、最優先で Japan を返す
+    if "japan" in text_lower or "jpn" in text_lower:
+        return "Japan"
+
+    # 2. その他の有効な国名が含まれているかチェック
+    for country in PROTON_FREE_COUNTRIES:
+        if len(country) > 2 and country.lower() in text_lower:
+            return country
+
+    # 3. 国名が直接見つからない場合のフォールバック
     lines = text.splitlines()
     for i, line in enumerate(lines):
-        # 「Browsing safely from」の次の行またはその付近に国名がある
         if "browsing" in line.lower() and "from" in line.lower():
             for j in range(i + 1, min(i + 4, len(lines))):
                 candidate = lines[j].strip()
+                cand_lower = candidate.lower()
+                
+                # UIボタンのテキストはスキップ
+                if cand_lower in ("disconnect", "connect", "change server", "change"):
+                    continue
+                    
                 if re.match(r"^[A-Za-z ]+$", candidate) and len(candidate) >= 2:
                     return candidate
-        # 直接国名が見つかる場合
-        stripped = line.strip()
-        if stripped in PROTON_FREE_COUNTRIES:
-            return stripped
 
     return None
 
