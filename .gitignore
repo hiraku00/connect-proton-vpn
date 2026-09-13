@@ -2,9 +2,6 @@
 proton_japan_watch.log
 proton_iphone_watch.log
 
-# iPhone版 設定ファイル（座標情報はローカル環境依存のため除外）
-proton_iphone.conf
-
 # macOS
 .DS_Store
 
